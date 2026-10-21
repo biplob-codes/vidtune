@@ -70,7 +70,6 @@ func findVideos(dir string) ([]string, error) {
 	return videos, nil
 }
 
-// NEW: ask ffprobe for the video length in seconds.
 func videoDuration(path string) (float64, error) {
 	out, err := exec.Command(
 		"ffprobe",
@@ -90,14 +89,95 @@ func videoDuration(path string) (float64, error) {
 	return secs, nil
 }
 
-// NEW: choose the moment to screenshot.
-// Music videos often start with black frames or logos and end with credits,
-// so we jump 30% in, where the performance usually is.
 func pickTimestamp(duration float64) float64 {
 	if duration < 10 {
-		return duration / 2 // very short clip: just take the middle
+		return duration / 2
 	}
 	return duration * 0.30
+}
+
+// NEW: find out which codec the first audio stream uses.
+func audioCodec(path string) (string, error) {
+	out, err := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=codec_name",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		path,
+	).Output()
+	if err != nil {
+		return "", fmt.Errorf("ffprobe failed for %s: %w", path, err)
+	}
+
+	codec := strings.TrimSpace(string(out))
+	if codec == "" {
+		return "", fmt.Errorf("%s has no audio stream", path)
+	}
+	return codec, nil
+}
+
+// NEW: run ffmpeg and include its error output if it fails.
+func runFFmpeg(args ...string) error {
+	cmd := exec.Command("ffmpeg", append([]string{"-y", "-loglevel", "error"}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ffmpeg: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// NEW: convert one video into an .m4a with embedded cover art.
+func convertOne(video string) (string, error) {
+	output := strings.TrimSuffix(video, filepath.Ext(video)) + ".m4a"
+	if _, err := os.Stat(output); err == nil {
+		return output, fmt.Errorf("%s already exists, skipping", output)
+	}
+
+	dur, err := videoDuration(video)
+	if err != nil {
+		return output, err
+	}
+	codec, err := audioCodec(video)
+	if err != nil {
+		return output, err
+	}
+
+	// The cover goes in a temp folder so we never leave stray .jpg files behind.
+	tmp, err := os.MkdirTemp("", "vidtune-")
+	if err != nil {
+		return output, err
+	}
+	defer os.RemoveAll(tmp)
+	cover := filepath.Join(tmp, "cover.jpg")
+
+	ts := strconv.FormatFloat(pickTimestamp(dur), 'f', 2, 64)
+
+	// Grab one frame, scaled down so it is at most 1000px wide.
+	if err := runFFmpeg(
+		"-ss", ts, "-i", video,
+		"-frames:v", "1",
+		"-vf", "scale='min(1000,iw)':-2",
+		"-q:v", "2",
+		cover,
+	); err != nil {
+		return output, fmt.Errorf("extracting cover: %w", err)
+	}
+
+	// AAC can be copied as-is (fast, lossless). Anything else gets re-encoded.
+	audioArgs := []string{"-c:a", "copy"}
+	if codec != "aac" {
+		audioArgs = []string{"-c:a", "aac", "-b:a", "192k"}
+	}
+
+	args := []string{"-i", video, "-i", cover, "-map", "0:a:0", "-map", "1:v"}
+	args = append(args, audioArgs...)
+	args = append(args, "-c:v", "copy", "-disposition:v:0", "attached_pic", output)
+
+	if err := runFFmpeg(args...); err != nil {
+		os.Remove(output) // don't leave a half-written file
+		return output, fmt.Errorf("building audio: %w", err)
+	}
+	return output, nil
 }
 
 func makeAudio() error {
@@ -113,15 +193,24 @@ func makeAudio() error {
 		return fmt.Errorf("no video files found in this folder")
 	}
 
-	fmt.Printf("Found %d video(s):\n", len(videos))
-	for _, v := range videos {
-		dur, err := videoDuration(v)
+	fmt.Printf("Found %d video(s)\n", len(videos))
+
+	done, failed := 0, 0
+	for i, v := range videos {
+		fmt.Printf("[%d/%d] %s\n", i+1, len(videos), v)
+		out, err := convertOne(v)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "  skipping:", err)
+			fmt.Fprintln(os.Stderr, "  failed:", err)
+			failed++
 			continue
 		}
-		ts := pickTimestamp(dur)
-		fmt.Printf("  - %s (%.0fs long, screenshot at %.1fs)\n", v, dur, ts)
+		fmt.Println("  ->", out)
+		done++
+	}
+
+	fmt.Printf("\nDone: %d converted, %d failed/skipped\n", done, failed)
+	if failed > 0 {
+		return fmt.Errorf("%d video(s) did not convert", failed)
 	}
 	return nil
 }
