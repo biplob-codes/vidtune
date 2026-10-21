@@ -16,9 +16,20 @@ func checkDeps() error {
 	return nil
 }
 
-// runFFmpeg runs ffmpeg quietly and returns its own error text on failure.
+// runFFmpeg runs ffmpeg quietly, at the lowest CPU priority, and returns
+// its own error text on failure.
 func runFFmpeg(args ...string) error {
-	cmd := exec.Command("ffmpeg", append([]string{"-y", "-loglevel", "error"}, args...)...)
+	ffArgs := append([]string{"-y", "-loglevel", "error", "-filter_threads", "1"}, args...)
+
+	name, full := "ffmpeg", ffArgs
+	// "nice -n 19" makes the OS give ffmpeg CPU time only when nothing
+	// else needs it. If nice is missing, we just run ffmpeg normally.
+	if nicePath, err := exec.LookPath("nice"); err == nil {
+		name = nicePath
+		full = append([]string{"-n", "19", "ffmpeg"}, ffArgs...)
+	}
+
+	cmd := exec.Command(name, full...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg: %s", strings.TrimSpace(string(out)))
 	}

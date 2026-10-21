@@ -45,11 +45,15 @@ func convertOne(video string) (string, error) {
 	ts := strconv.FormatFloat(pickTimestamp(dur), 'f', 2, 64)
 
 	// Grab one frame, scaled down so it is at most 1000px wide.
+	// The first -threads 1 limits the video decoder (before -i),
+	// the second limits the JPEG encoder (before the output file).
 	if err := runFFmpeg(
+		"-threads", "1",
 		"-ss", ts, "-i", video,
 		"-frames:v", "1",
 		"-vf", "scale='min(1000,iw)':-2",
 		"-q:v", "2",
+		"-threads", "1",
 		cover,
 	); err != nil {
 		return output, fmt.Errorf("extracting cover: %w", err)
